@@ -1,0 +1,8 @@
+# PlatformIO & Arduino build artifacts
+.pio/
+.vscode/
+*.bin
+*.elf
+*.hex
+*.o
+*.d
