@@ -9,10 +9,12 @@
 #include "pi_aw_controller.h"
 
 #include "decel_tail_shaper.h"
+#include "imu_observer.h"
+#include "firmware_config.h"
 
 
 
-#define D2_BUILD "DUAL-GOV7-LOW-STARTUP-20261107-B2"
+#define D2_BUILD "DUAL-C8-A1-PACKAGED-20261110"
 
 #ifndef D2_LOW_STARTUP_SCALE
 #define D2_LOW_STARTUP_SCALE 1.2f
@@ -40,6 +42,11 @@ enum D2Fault { D2_NONE, D2_WATCHDOG, D2_DEADLINE, D2_STALL1, D2_STALL2,
                D2_POLARITY, D2_DIVERGENCE, D2_TIMING, D2_CONFIG, D2_TIMER, D2_BOTH_PULSES_LOST };
 
 struct D2Tune { float kp, ki, kaw, slope, offset, ramp, jerk; };
+namespace robot_config {
+static inline D2Tune tune_from(const float (&v)[7]) {return {v[0],v[1],v[2],v[3],v[4],v[5],v[6]};}
+static inline D2Tune low_tune(unsigned i) {return tune_from(LOW_TUNING[i]);}
+static inline D2Tune high_tune(unsigned i) {return tune_from(HIGH_TUNING[i]);}
+}
 
 struct D2GainSchedule {
     D2Tune high[2];
@@ -47,6 +54,85 @@ struct D2GainSchedule {
     uint32_t update_sequence;
     uint8_t staged;
     bool enabled, active_for_run, integral_clamped;
+};
+
+
+struct D2HighCtrl {
+    uint8_t mode; // 0=OFF (original B2), 1=HIGH accel cap only, 2=HIGH accel cap + IMU heading PD
+    float a_max; // default 0.50 m/s^2
+    float k_yaw; // default 1.0 /s
+    float k_rate; // default 0.15
+    float max_omega; // default 0.15 rad/s
+    float slew_omega; // default 0.75 rad/s^2
+
+    // Runtime state (telemetry / per-run tracking)
+    bool active;
+    bool imu_ok;
+    bool headroom_limited;
+    bool reference_valid;
+    bool used_in_run; // Retain reference offsets through LOW and terminal IDLE telemetry.
+    bool accel_limited;
+    float high_weight;
+    float yaw_ref;
+    float current_yaw;
+    float gyro_z;
+    float yaw_err;
+    float omega_cmd;
+    float omega_filtered;
+    float wheel_offset[2]; // signed differential wheel reference offset (meters)
+    float max_wheel_offset;
+    uint32_t imu_epoch;
+    uint32_t last_imu_sample_ms;
+};
+
+static inline bool d2_high_imu_ready(const ImuObserver *im,uint32_t ms) {
+    return im && im->connected && im->calibrated && !im->calibrating && im->valid &&
+        im->error==0 && im->calibration_id!=0 && (uint32_t)(ms-im->sample_ms)<=50 &&
+        isfinite(im->rpy[2]) && isfinite(im->gyro[2]);
+}
+
+static inline bool d2_valid_high_ctrl(uint8_t mode, float a_max, float k_yaw, float k_rate, float max_omega, float slew_omega) {
+    if (mode != robot_config::HIGH_MODE) return false;
+    if (!isfinite(a_max) || a_max < 0.1f || a_max > 2.0f) return false;
+    if (!isfinite(k_yaw) || k_yaw < 0.0f || k_yaw > 5.0f) return false;
+    if (!isfinite(k_rate) || k_rate < 0.0f || k_rate > 1.0f) return false;
+    if (!isfinite(max_omega) || max_omega < 0.01f || max_omega > 0.50f) return false;
+    if (!isfinite(slew_omega) || slew_omega < 0.1f || slew_omega > 2.0f) return false;
+    return true;
+}
+
+// Angular feedback is enabled at boot for TURN_TIME. Raw odometry remains
+// encoder-derived. No geometry/gyro scale learning and no automatic reversal.
+struct D2TurnFeedback {
+    bool enabled,used_in_run,active,valid;
+    uint8_t stop_reason; // 0 ongoing,1 target,2 deadline,3 invalid IMU,4 disagreement,5 fine alignment unverified
+    uint32_t epoch,sample_ms;
+    float yaw_ref,target_rad,angle_rad,yaw_rate,offset_m,rate_offset_mps;
+    float target_offset_m; // latched physical wheel target correction at cutoff
+    uint8_t finish_phase; // 0 original motion,1 observe coast,2 one forward pulse,3 final coast
+    bool correction_used;
+    uint32_t cutoff_ms,last_edge_ms,correction_ms,pulse_ms;
+    uint16_t correction_elapsed_ms;
+    int64_t finish_count[2];
+    float cutoff_angle_rad,correction_start_rad;
+};
+
+struct D2CreepAssist {
+    float boost[2],peak[2];
+    uint16_t quiet_ms[2],assisted_ms[2];
+    int64_t last_count[2];
+    bool used[2],spent[2];
+    int64_t start_count[2],credit_count[2];
+    uint16_t confirm_ms[2];
+    bool confirmed[2],failed[2];
+};
+
+struct D2TerminalSettle {
+    bool used,pending,qualified;
+    uint8_t rejection; // 0 none,1 position,2 heading/IMU,3 no quiet window
+    uint32_t start_ms,last_pulse_ms,elapsed_ms,quiet_ms;
+    int64_t last_count[2];
+    float error_m[2],limit_m,yaw_error_deg;
 };
 
 struct D2Core {
@@ -127,9 +213,20 @@ struct D2Core {
 
     alignas(8) D2GainSchedule gains;
 
-    // Per-run startup only; never reused for braking or terminal creep.
+        // Per-run startup only; never reused for braking or terminal creep.
     float low_startup_s;
 
+    D2HighCtrl high_ctrl;
+    float common_v;
+    float peak_achieved_mps;
+    // Diagnostics: SP passed through the SAME time-window and filter as measured RPM.
+    double reference_rpm_ms[2], reference_history[2][6];
+    float observed_reference_rpm[2];
+    float startup_accel_scale;
+    bool startup_heading_guard;
+    D2TurnFeedback turn_feedback;
+    D2CreepAssist creep;
+    D2TerminalSettle terminal_settle;
 };
 
 static inline int d2_wheel_direction(const D2Core &c,int i) {
@@ -139,6 +236,84 @@ static inline int d2_wheel_direction(const D2Core &c,int i) {
 }
 
 static inline float d2_clamp(float x, float lo, float hi) { return fminf(hi, fmaxf(lo, x)); }
+
+static inline float d2_feedback_progress(const D2Core &c,int i) {
+    float encoder=d2_wheel_direction(c,i)*c.distance[i];
+    return c.turn_feedback.used_in_run?encoder+c.turn_feedback.offset_m:encoder;
+}
+
+static inline float d2_feedback_speed(const D2Core &c,int i,float tick_mps) {
+    float encoder=d2_wheel_direction(c,i)*tick_mps;
+    return c.turn_feedback.used_in_run?encoder+c.turn_feedback.rate_offset_mps:encoder;
+}
+
+// MOVE_DIST target in the same normalized encoder frame as terminal latching.
+// A latched arrival may move back by one encoder quantum; a larger retreat is
+// an unverified position and must not keep both outputs off until the deadline.
+static inline float d2_distance_wheel_target(const D2Core &c,int i) {
+    return c.target_m+((c.high_ctrl.mode==2&&c.high_ctrl.used_in_run)?c.high_ctrl.wheel_offset[i]:0.0f);
+}
+static inline float d2_terminal_quantum(const D2Core &c,int i) {
+    return D2_PI*c.diameter[i]/D2_CPR;
+}
+static inline bool d2_distance_arrived(const D2Core &c,int i) {
+    float tolerance=.0005f+(c.distance_wheel_done[i]?d2_terminal_quantum(c,i):0.0f);
+    return d2_wheel_direction(c,i)*c.distance[i]>=d2_distance_wheel_target(c,i)-tolerance;
+}
+
+// One bounded terminal-friction episode, not a kick stopped by the first edge.
+// A pulse may be elastic recoil; progress is credited only after a net advance
+// holds. The600ms episode budget is absolute and never reset by encoder jitter.
+static inline float d2_creep_assist(D2Core &c,int i,float shaped,uint32_t dt) {
+    auto &a=c.creep;
+    int64_t delta=d2_wheel_direction(c,i)*(c.counts[i]-a.last_count[i]);
+    bool pulse=delta!=0;a.last_count[i]=c.counts[i];a.confirmed[i]=false;
+    float remaining=d2_distance_wheel_target(c,i)-d2_wheel_direction(c,i)*c.distance[i];
+    float speed=shaped*D2_PI*c.diameter[i]/60;
+    bool eligible=c.state==D2_MOVE&&c.distance_priority&&!c.time_priority&&!c.turning&&
+        c.distance_phase==2&&!c.distance_wheel_done[i]&&remaining>.0005f&&remaining<=.008f&&
+        shaped>1&&speed<=.030001f;
+    if(!eligible) {
+        if(a.used[i]&&!a.spent[i]) {
+            a.spent[i]=true;
+            if(c.state==D2_MOVE&&!d2_distance_arrived(c,i))a.failed[i]=true;
+        }
+        a.boost[i]=0;a.quiet_ms[i]=0;return 0;
+    }
+    if(a.spent[i])return 0;
+    if(!a.used[i]) {
+        if(pulse||fabsf(c.rpm[i])>=1){a.quiet_ms[i]=0;return 0;}
+        a.quiet_ms[i]=(uint16_t)fminf(1000,a.quiet_ms[i]+dt);
+        if(a.quiet_ms[i]<500||c.pi[i].applied_pwm<40||c.pi[i].applied_pwm>=120)return 0;
+        a.used[i]=true;a.start_count[i]=a.credit_count[i]=c.counts[i];
+        // Grant one finite terminal episode, not a per-pulse stall reset.
+        c.stall_ms[i]=0;
+    }
+    a.assisted_ms[i]=(uint16_t)fminf(1000,a.assisted_ms[i]+dt);
+    if(a.assisted_ms[i]>600) {
+        // Exhausting extra-force authority is not itself a stall. Preserve
+        // ordinary PI completion if credited progress is still retained;
+        // the existing stall/deadline guards remain authoritative afterwards.
+        bool retained=d2_wheel_direction(c,i)*(a.credit_count[i]-a.start_count[i])>=2&&
+                      d2_wheel_direction(c,i)*(c.counts[i]-a.credit_count[i])>=0;
+        a.spent[i]=true;a.failed[i]=!retained;a.boost[i]=0;return 0;
+    }
+    if(d2_wheel_direction(c,i)*(c.counts[i]-a.start_count[i])*d2_terminal_quantum(c,i)>.008f) {
+        a.spent[i]=a.failed[i]=true;a.boost[i]=0;return 0;
+    }
+    if(d2_wheel_direction(c,i)*(c.counts[i]-a.credit_count[i])>=2) {
+        a.confirm_ms[i]=(uint16_t)fminf(1000,a.confirm_ms[i]+dt);
+        if(a.confirm_ms[i]>=40){a.confirmed[i]=true;a.credit_count[i]=c.counts[i];a.confirm_ms[i]=0;}
+    } else a.confirm_ms[i]=0;
+    // Breakaway force is only needed while stationary. Remove the extra
+    // force on ANY observed advance, without spending the recovery episode.
+    // If that edge recoils, force can ramp again within the SAME fixed budget.
+    // This avoids accumulating extra force while the RPM filter catches up.
+    if(delta>0||d2_wheel_direction(c,i)*c.rpm[i]>=1)a.boost[i]=0;
+    else a.boost[i]=fminf(24,a.boost[i]+2*(dt/20.0f));
+    a.peak[i]=fmaxf(a.peak[i],a.boost[i]);
+    return a.boost[i];
+}
 
 static inline bool d2_running(const D2Core &c) {
 
@@ -154,6 +329,7 @@ static inline void d2_disable(D2Core &c) {
     for (int i=0;i<2;i++) {
 
         c.pwm[i]=c.base[i]=c.effective[i]=0;
+        c.creep.boost[i]=0;c.creep.quiet_ms[i]=0;
 
         pi_controller_init(&c.pi[i]);
 
@@ -163,51 +339,71 @@ static inline void d2_disable(D2Core &c) {
 
     c.trim=0;c.accuracy_scale=1.0f;c.governor_scale=1.0f;c.governor_pressure_ms=0;c.lead_cap_rpm=0;c.governor_last_pressure=false;c.position_trim_rpm=0;c.position_cutoff_latched=false;c.distance_priority=false;c.distance_phase=0;c.distance_wheel_done[0]=c.distance_wheel_done[1]=false;
 
-    c.terminal_coasting[0]=c.terminal_coasting[1]=false;c.terminal_learned[0]=c.terminal_learned[1]=false;
-
+        c.terminal_coasting[0]=c.terminal_coasting[1]=false;c.terminal_learned[0]=c.terminal_learned[1]=false;
+    c.high_ctrl.active = false;
+    c.turn_feedback.active = false;
+    c.high_ctrl.high_weight = 0.0f;
+    c.high_ctrl.omega_cmd = c.high_ctrl.omega_filtered = 0.0f;
+    c.high_ctrl.headroom_limited = false;
+    c.common_v = 0.0f;
 }
 
 static inline void d2_fault(D2Core &c, D2Fault f) {
 
+    c.terminal_settle.pending=false;
     d2_disable(c); c.fault=f; c.state=D2_FAULT;
 
 }
 
 static inline void d2_stop(D2Core &c) {
 
+    c.terminal_settle.pending=false;
     d2_disable(c); if (c.state!=D2_FAULT) c.state=D2_IDLE;
 
 }
 
 static inline void d2_init(D2Core &c, uint32_t ms) {
-    memset(&c, 0, sizeof(c));
-    // Bank LOW parameters (0.0 - 0.30 m/s: locked and verified on physical robot)
-    c.tune[0] = {1.0800f, 1.1800f, 0.5000f, 3.1300f, 45.9000f, 320.0f, 1500.0f};
-    c.tune[1] = {1.1100f, 1.2200f, 0.5000f, 3.0780f, 68.3500f, 320.0f, 1500.0f};
-    c.diameter[0] = c.diameter[1] = 0.1f;
-    c.track = 0.4f;
-    // MCU limits & instantaneous cross-coupling sync
-    c.max_rpm = 114.592f;   // 0.60 m/s limit at 100mm wheel diameter
-    c.max_pwm = 470.0f;     // Bounded 10-bit PWM cap
-    c.slew = 27.0f;         // Max PWM change per 20ms tick
-    c.sync_kp = 720.0f;     // Instantaneous restoring trim gain
-    c.sync_max = 18.0f;     // Max differential speed trim (RPM)
-    c.divergence = 0.04f;   // 40 mm divergence guard
-    c.direction = 1;
-    c.last_step_ms = c.heartbeat_ms = ms;
-    c.quiet_ms = ms;
-    c.configured = true;    // Pre-configured with verified parameters on boot
-    d2_disable(c);
-    c.governor_min_scale = 1.0f;
 
-    // Bank HIGH parameters (0.40 - 0.60 m/s: Gain Scheduling enabled)
-    c.gains.high[0] = {1.4500f, 0.5500f, 2.0000f, 3.0200f, 44.4000f, 320.0f, 1500.0f};
-    c.gains.high[1] = {1.4800f, 0.5800f, 2.0000f, 2.9800f, 65.0000f, 320.0f, 1500.0f};
-    c.gains.enabled = true;
-    c.gains.transition_s = 0.150f;
-    c.gains.staged = 0;
-    c.gains.alpha = c.gains.target_alpha = 0;
-    c.gains.active_for_run = false;
+    memset(&c,0,sizeof(c));
+
+    c.tune[0]=robot_config::low_tune(0);
+
+    c.tune[1]=robot_config::low_tune(1);
+
+    c.diameter[0]=c.diameter[1]=robot_config::WHEEL_DIAMETER_M; c.track=robot_config::TRACK_M;
+
+    c.max_rpm=robot_config::MAX_RPM; c.max_pwm=robot_config::MAX_PWM;
+    c.slew=robot_config::PWM_SLEW; c.sync_kp=robot_config::SYNC_KP; c.sync_max=robot_config::SYNC_MAX_RPM;
+
+    c.divergence=robot_config::DIVERGENCE_M; c.direction=1; c.last_step_ms=c.heartbeat_ms=ms;
+
+        c.quiet_ms=ms; c.configured=true; d2_disable(c);c.governor_min_scale=1.0f;
+    c.high_ctrl.mode = robot_config::HIGH_MODE;
+    c.high_ctrl.a_max = robot_config::HIGH_A_MAX;
+    c.high_ctrl.k_yaw = robot_config::HIGH_K_YAW;
+    c.high_ctrl.k_rate = robot_config::HIGH_K_RATE;
+    c.high_ctrl.max_omega = robot_config::HIGH_MAX_OMEGA;
+    c.high_ctrl.slew_omega = robot_config::HIGH_SLEW_OMEGA;
+    c.high_ctrl.active = false;
+    c.high_ctrl.imu_ok = false;
+    c.high_ctrl.headroom_limited = false;
+    c.high_ctrl.high_weight = 0.0f;
+    c.high_ctrl.yaw_ref = 0;
+    c.high_ctrl.current_yaw = 0;
+    c.high_ctrl.gyro_z = 0;
+    c.high_ctrl.yaw_err = 0;
+    c.high_ctrl.omega_cmd = 0;
+    c.high_ctrl.omega_filtered = 0;
+    c.high_ctrl.wheel_offset[0] = c.high_ctrl.wheel_offset[1] = 0;
+    c.high_ctrl.max_wheel_offset = 0.06f;
+    c.high_ctrl.imu_epoch = 0;
+    c.high_ctrl.last_imu_sample_ms = 0;
+    c.gains.high[0]=robot_config::high_tune(0);
+    c.gains.high[1]=robot_config::high_tune(1);
+    c.gains.enabled=true; c.gains.transition_s=robot_config::GAIN_TRANSITION_S;
+    c.turn_feedback.enabled=true;
+    c.common_v = 0.0f;
+    c.peak_achieved_mps = 0;
 }
 
 static inline bool d2_valid_tune(const D2Tune &t) {
@@ -310,7 +506,7 @@ static inline void d2_gs_rebase(D2Core &c,int i,const D2Tune &old,const D2Tune &
 // Update one active straight command, not a new move. Identity/sequence and
 // the original deadline remain mandatory. A rejected request changes nothing.
 static inline bool d2_update_speed(D2Core &c,float mps,uint32_t run_id,
-                                  uint32_t sequence,uint32_t ms) {
+                                  uint32_t sequence,uint32_t ms,const ImuObserver *imu=nullptr) {
     if(!d2_gs_eligible(c)||!c.outputs||c.fault!=D2_NONE||!c.configured||
        run_id!=c.run_id||sequence==0||c.gains.update_sequence==UINT32_MAX||
        sequence!=c.gains.update_sequence+1||!isfinite(mps)||mps<.01f||mps>.6f||
@@ -327,6 +523,13 @@ static inline bool d2_update_speed(D2Core &c,float mps,uint32_t run_id,
         float bound=mps;
         for(int i=0;i<2;i++)bound=fmaxf(bound,fmaxf(fabsf(c.rpm[i]),fabsf(c.effective[i]))*D2_PI*c.diameter[i]/60);
         if(progress+bound*remaining_time>5)return false;
+    }
+    if(c.distance_priority && !c.time_priority && !c.turning && c.high_ctrl.mode>0) {
+        if(c.high_ctrl.mode==2 && mps>.30f &&
+           (!c.high_ctrl.reference_valid || !isfinite(c.high_ctrl.yaw_ref) ||
+            !d2_high_imu_ready(imu,ms) || imu->calibration_id!=c.high_ctrl.imu_epoch))return false;
+        c.high_ctrl.active=mps>.30f;
+        if(c.high_ctrl.mode==2 && mps>.30f)c.high_ctrl.used_in_run=true;
     }
     if(c.state==D2_SPEED)c.speed_rpm=mps*60/(D2_PI*c.diameter[0]);
     else c.cruise_mps=mps;
@@ -378,7 +581,23 @@ static inline bool d2_start(D2Core &c,int mode,float value,float seconds,uint32_
 
     } else if(fabsf(value)>c.max_rpm||fabsf(value)*D2_PI*c.diameter[0]/60*seconds>5)return false;
 
-    c.low_startup_s=0;
+    bool turn_feedback_enabled=c.turn_feedback.enabled;
+    memset(&c.turn_feedback,0,sizeof(c.turn_feedback));
+    memset(&c.creep,0,sizeof(c.creep));
+    memset(&c.terminal_settle,0,sizeof(c.terminal_settle));
+    c.turn_feedback.enabled=turn_feedback_enabled;
+        c.low_startup_s=0;
+    c.high_ctrl.active = false;
+    c.high_ctrl.high_weight = 0.0f;
+    c.high_ctrl.wheel_offset[0] = c.high_ctrl.wheel_offset[1] = 0.0f;
+    c.high_ctrl.omega_cmd = c.high_ctrl.omega_filtered = 0.0f;
+    c.high_ctrl.headroom_limited = false;
+    c.high_ctrl.reference_valid=false;c.high_ctrl.used_in_run=false;c.high_ctrl.imu_ok=false;
+    c.high_ctrl.imu_epoch=0;c.high_ctrl.yaw_ref=0;c.high_ctrl.yaw_err=0;
+    c.high_ctrl.accel_limited=false;
+    c.startup_accel_scale=1;c.startup_heading_guard=false;
+    c.common_v = 0.0f;
+    c.peak_achieved_mps = 0;
     c.trajectory_velocity_mps=0;c.time_priority=false;c.turning=false;c.direction=value>0?1:-1;c.target_m=mode==0?fabsf(value):0;
 
     c.speed_rpm=mode==1?fabsf(value):0;c.duration_s=seconds;c.cruise_mps=cruise;c.ramp_s=ramp;
@@ -407,13 +626,21 @@ static inline bool d2_start(D2Core &c,int mode,float value,float seconds,uint32_
 
 // Explicit, bounded distance-priority admission; duration is a hard deadline.
 
-static inline bool d2_start_distance(D2Core &c,float distance,float speed_mps,float deadline_s,uint32_t ms,uint32_t run_id) {
+static inline bool d2_start_distance(D2Core &c,float distance,float speed_mps,float deadline_s,uint32_t ms,uint32_t run_id,const ImuObserver *imu=nullptr) {
 
     if(!isfinite(distance)||!isfinite(speed_mps)||!isfinite(deadline_s)||speed_mps<.01f||speed_mps>.6f||deadline_s<.5f||deadline_s>60.0f)return false;
 
     float nominal=fabsf(distance)/speed_mps+.5f;
 
     if(nominal>deadline_s || nominal>60.0f)return false;
+    if(c.high_ctrl.mode>0 && speed_mps>.30f) {
+        // Optimistic lower bound: acceleration only, no braking/settling budget.
+        // Reject definitely impossible deadlines; accepting is not a timing guarantee.
+        float accel_distance=speed_mps*speed_mps/(2*c.high_ctrl.a_max);
+        float minimum=fabsf(distance)<=accel_distance?sqrtf(2*fabsf(distance)/c.high_ctrl.a_max):
+            speed_mps/c.high_ctrl.a_max+(fabsf(distance)-accel_distance)/speed_mps;
+        if(minimum>deadline_s)return false;
+    }
 
     float ramp=fminf(.5f,nominal*.25f);
 
@@ -425,11 +652,27 @@ static inline bool d2_start_distance(D2Core &c,float distance,float speed_mps,fl
 
     }
 
+    if(c.high_ctrl.mode==2 && speed_mps>.30f && !d2_high_imu_ready(imu,ms))return false;
     if(!d2_start(c,0,distance,nominal,ms,run_id))return false;
 
     c.duration_s=deadline_s;c.cruise_mps=speed_mps;c.distance_priority=true;
     // Latch on admission, so live speed changes cannot re-arm this envelope.
     c.low_startup_s=c.ramp_s*(speed_mps<=.300001f?D2_LOW_STARTUP_SCALE:1.0f);
+    bool high_eligible = (c.high_ctrl.mode > 0) && !c.turning && c.distance_priority && (c.cruise_mps > .30f);
+    c.high_ctrl.active = high_eligible;
+    c.high_ctrl.high_weight = high_eligible ? d2_gs_weight(speed_mps) : 0.0f;
+    c.high_ctrl.used_in_run=high_eligible && c.high_ctrl.mode==2;
+    if(c.high_ctrl.mode==2 && d2_high_imu_ready(imu,ms)) {
+        c.high_ctrl.reference_valid=true;c.high_ctrl.imu_ok=true;
+        c.high_ctrl.yaw_ref=imu->rpy[2];c.high_ctrl.imu_epoch=imu->calibration_id;
+        c.high_ctrl.last_imu_sample_ms=imu->sample_ms;
+    }
+    c.high_ctrl.wheel_offset[0] = c.high_ctrl.wheel_offset[1] = 0.0f;
+    c.high_ctrl.max_wheel_offset = fminf(0.06f, 0.25f * c.target_m);
+    c.high_ctrl.omega_cmd = c.high_ctrl.omega_filtered = 0.0f;
+    c.high_ctrl.headroom_limited = false;
+    c.common_v = 0.0f;
+    c.peak_achieved_mps = 0;
     d2_gs_begin(c);
 
     return true;
@@ -507,18 +750,81 @@ static inline bool d2_start_timed(D2Core &c,float distance,float seconds,bool tu
 
 }
 
-static inline bool d2_start_turn_time(D2Core &c,float angle_rad,float seconds,uint32_t ms,uint32_t run_id) {
+static inline bool d2_start_turn_time(D2Core &c,float angle_rad,float seconds,uint32_t ms,uint32_t run_id,const ImuObserver *imu=nullptr) {
 
     if(!isfinite(angle_rad)||fabsf(angle_rad)<D2_MIN_TURN_RAD||fabsf(angle_rad)>2*D2_PI)return false;
 
-    return d2_start_timed(c,angle_rad*c.track*.5f,seconds,true,ms,run_id);
+    if(c.turn_feedback.enabled&&!d2_high_imu_ready(imu,ms))return false;
+    if(!d2_start_timed(c,angle_rad*c.track*.5f,seconds,true,ms,run_id))return false;
+    if(c.turn_feedback.enabled) {
+        c.turn_feedback.used_in_run=c.turn_feedback.active=c.turn_feedback.valid=true;
+        c.turn_feedback.epoch=imu->calibration_id;c.turn_feedback.sample_ms=imu->sample_ms;
+        c.turn_feedback.yaw_ref=imu->rpy[2];c.turn_feedback.target_rad=angle_rad;
+    }
+    return true;
 
 }
 
 static inline void d2_soft_stop(D2Core &c,uint32_t ms) {
 
-    if(d2_running(c)&&c.state!=D2_STOPPING){c.state=D2_STOPPING;c.stop_ms=ms;}
+    if(d2_running(c)&&c.state!=D2_STOPPING){
+        // Preserve every normal target/turn/deadline/fault path. Only an
+        // exhausted straight terminal attempt may qualify by settled pose.
+        if(c.distance_stop_reason==4 && c.state==D2_MOVE && c.distance_priority &&
+           !c.time_priority && !c.turning && c.distance_phase==2) {
+            auto &t=c.terminal_settle;t.used=t.pending=true;t.qualified=false;
+            t.start_ms=t.last_pulse_ms=ms;t.limit_m=fminf(.01f,.01f*c.target_m);
+            for(int i=0;i<2;i++)t.last_count[i]=c.counts[i];
+            c.distance_stop_reason=0; // Pending verification, not target reached.
+        }
+        if(c.turn_feedback.used_in_run) {
+            c.turn_feedback.target_offset_m=c.turn_feedback.offset_m;
+            c.turn_feedback.active=false;
+            if(!c.turn_feedback.stop_reason)c.turn_feedback.stop_reason=c.distance_stop_reason;
+        }
+        c.state=D2_STOPPING;c.stop_ms=ms;
+    }
 
+}
+
+// A zero-output observation window. Never restarts a latched wheel, changes
+// the target or grants additional force. Existing 10mm position /1deg heading
+// limits are upper bounds; tiny commands also obey a stricter1% distance cap.
+static inline void d2_terminal_settle_tick(D2Core &c,uint32_t ms,const ImuObserver *imu) {
+    auto &t=c.terminal_settle;if(!t.pending)return;
+    if(c.state!=D2_STOPPING || c.fault!=D2_NONE){t.pending=false;return;}
+    t.elapsed_ms=ms-t.start_ms;
+    for(int i=0;i<2;i++) {
+        if(t.last_count[i]!=c.counts[i])t.last_pulse_ms=ms;
+        t.last_count[i]=c.counts[i];
+        t.error_m[i]=d2_wheel_direction(c,i)*c.distance[i]-d2_distance_wheel_target(c,i);
+    }
+    t.quiet_ms=ms-t.last_pulse_ms;
+    bool stopped=c.pwm[0]<1&&c.pwm[1]<1&&fabsf(c.rpm[0])<1.5f&&fabsf(c.rpm[1])<1.5f;
+    if(stopped || ms-c.stop_ms>=500)d2_disable(c);
+    float center=(c.direction*(c.distance[0]+c.distance[1])*.5f)-c.target_m;
+    bool pose=isfinite(center)&&isfinite(t.limit_m)&&t.limit_m>0&&
+              fabsf(center)<=t.limit_m;
+    for(int i=0;i<2;i++)pose=pose&&isfinite(t.error_m[i])&&fabsf(t.error_m[i])<=t.limit_m;
+    t.yaw_error_deg=(c.distance[1]-c.distance[0])/c.track*180/D2_PI;
+    bool heading=isfinite(t.yaw_error_deg)&&fabsf(t.yaw_error_deg)<=1;
+    if(c.high_ctrl.mode==2&&(c.high_ctrl.reference_valid||c.high_ctrl.used_in_run)) {
+        heading=c.high_ctrl.reference_valid&&d2_high_imu_ready(imu,ms)&&imu->calibration_id==c.high_ctrl.imu_epoch;
+        if(heading) {
+            float angle=imu->rpy[2]-c.high_ctrl.yaw_ref;
+            t.yaw_error_deg=atan2f(sinf(angle),cosf(angle))*180/D2_PI;
+            heading=isfinite(t.yaw_error_deg)&&fabsf(t.yaw_error_deg)<=1;
+        }
+    }
+    t.rejection=!pose?1:!heading?2:3;
+    if(!c.outputs&&stopped&&t.quiet_ms>=200&&pose&&heading) {
+        t.pending=false;t.qualified=true;t.rejection=0;
+        c.distance_stop_reason=5; // Settled within tolerance, not exact cutoff.
+        d2_stop(c);return;
+    }
+    if(t.elapsed_ms>=700) {
+        t.pending=false;c.distance_stop_reason=4;d2_stop(c);
+    }
 }
 
 static inline bool d2_clear(D2Core &c,uint32_t ms,bool timer_healthy) {
@@ -529,13 +835,60 @@ static inline bool d2_clear(D2Core &c,uint32_t ms,bool timer_healthy) {
 
 }
 
-static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
+static inline void d2_turn_power_off(D2Core &c) {
+    c.outputs=false;
+    for(int i=0;i<2;i++) {
+        c.base[i]=c.effective[i]=c.pwm[i]=0;
+        pi_controller_init(&c.pi[i]);memset(&c.result[i],0,sizeof(c.result[i]));
+    }
+}
+
+// A single bounded fine pulse AFTER observed standstill, only inside the
+// original TURN_TIME command. No reverse, no host retry, no force after deadline.
+static inline bool d2_turn_finish_tick(D2Core &c,uint32_t ms) {
+    auto &t=c.turn_feedback;
+    for(int i=0;i<2;i++) {
+        if(t.finish_count[i]!=c.counts[i])t.last_edge_ms=ms;
+        t.finish_count[i]=c.counts[i];
+    }
+    float error=fabsf(t.target_rad)-c.direction*t.angle_rad;
+    bool quiet=fabsf(c.rpm[0])<1.5f&&fabsf(c.rpm[1])<1.5f&&
+               fabsf(t.yaw_rate)<.035f&&ms-t.last_edge_ms>=80;
+    float elapsed=(ms-c.start_ms)*.001f;
+    if(t.finish_phase==2) {
+        t.correction_elapsed_ms=(uint16_t)fminf(1000,ms-t.correction_ms);
+        if(ms-t.correction_ms>=t.pulse_ms || error<=.05f*D2_PI/180 || elapsed>=c.duration_s) {
+            t.finish_phase=3;d2_turn_power_off(c);
+        }
+    } else {
+        bool stopped=c.pwm[0]<1&&c.pwm[1]<1;
+        if(stopped&&(quiet||ms-t.cutoff_ms>=500))d2_turn_power_off(c);
+        if(!c.outputs&&quiet) {
+            uint32_t pulse=(uint32_t)d2_clamp((error-.15f*D2_PI/180)*c.track*.5f/.03f*1000,40,140);
+            if(t.finish_phase==1&&!t.correction_used&&error>.35f*D2_PI/180&&error<=2*D2_PI/180&&
+               elapsed+(pulse+40)*.001f<c.duration_s) {
+                t.correction_used=true;t.finish_phase=2;t.correction_ms=ms;t.pulse_ms=pulse;
+                t.correction_start_rad=t.angle_rad;c.outputs=true;
+            } else {
+                if(fabsf(error)>2*D2_PI/180)t.stop_reason=5;
+                return true;
+            }
+        }
+    }
+    if(ms-t.cutoff_ms>=700) {t.stop_reason=5;d2_turn_power_off(c);return true;}
+    return false;
+}
+
+static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms,const ImuObserver *imu=nullptr) {
 
     uint32_t dt=ms-c.last_step_ms;if(dt<20)return;
 
     c.last_step_ms=ms;if(dt>c.max_dt_ms)c.max_dt_ms=dt;
 
     int64_t raw[2]={raw1,raw2};
+    // Previous effective SP was held over the elapsed interval. Count observation
+    // and reference integration use the same sample instants; no fitted time shift.
+    for(int i=0;i<2;i++)c.reference_rpm_ms[i]+=(double)c.effective[i]*dt;
 
     // Encoder signs fixed to vehicle-forward frame: M1=-1, M2=+1.
 
@@ -559,7 +912,10 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
 
     unsigned slot=c.history_pos;
 
-    for(int i=0;i<2;i++)c.history[i][slot]=c.counts[i];
+    for(int i=0;i<2;i++){
+        c.history[i][slot]=c.counts[i];
+        c.reference_history[i][slot]=c.reference_rpm_ms[i];
+    }
 
     c.history_ms[slot]=ms;c.history_pos=(slot+1)%6;if(c.history_size<6)c.history_size++;
 
@@ -574,6 +930,8 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
             c.raw_rpm[i]=(float)(c.counts[i]-c.history[i][oldest])*60000/(D2_CPR*window);
 
             c.rpm[i]=.6f*c.raw_rpm[i]+.4f*c.rpm[i];
+            float reference=(float)((c.reference_rpm_ms[i]-c.reference_history[i][oldest])/window);
+            c.observed_reference_rpm[i]=.6f*reference+.4f*c.observed_reference_rpm[i];
 
         }
 
@@ -595,7 +953,13 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
 
     float progress=(d2_wheel_direction(c,0)*c.distance[0]+d2_wheel_direction(c,1)*c.distance[1])*.5f;
 
-    float error=d2_wheel_direction(c,0)*c.distance[0]-d2_wheel_direction(c,1)*c.distance[1];
+    float raw_error=d2_wheel_direction(c,0)*c.distance[0]-d2_wheel_direction(c,1)*c.distance[1];
+    float error=raw_error;
+    if(c.high_ctrl.mode==2 && c.high_ctrl.used_in_run) {
+        float rel0 = d2_wheel_direction(c,0)*c.distance[0] - c.high_ctrl.wheel_offset[0];
+        float rel1 = d2_wheel_direction(c,1)*c.distance[1] - c.high_ctrl.wheel_offset[1];
+        error = rel0 - rel1;
+    }
 
     // Additional loss-of-pulses guard only after movement is established and
 
@@ -633,11 +997,48 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
 
     if(fabsf(progress)>5.03f){d2_fault(c,D2_DEADLINE);return;}
 
+    // All preceding pulse/divergence/overtravel guards use REAL encoders.
+    // Only a latched TURN_TIME uses IMU angle for its outer angular position
+    // loop. The encoder-derived difference (center translation) is preserved.
+    if(c.turn_feedback.used_in_run && c.turning && c.time_priority) {
+        auto &t=c.turn_feedback;
+        bool healthy=d2_high_imu_ready(imu,ms)&&imu->calibration_id==t.epoch;
+        float angle=0,rate=0,offset=0;
+        if(healthy) {
+            float cp=cosf(imu->rpy[1]);
+            healthy=isfinite(cp)&&cp>.2f;
+            if(healthy) {
+                angle=imu->rpy[2]-t.yaw_ref; // unwrapped; 360 is not zero progress
+                rate=(imu->gyro[1]*sinf(imu->rpy[0])+imu->gyro[2]*cosf(imu->rpy[0]))/cp;
+                offset=c.direction*angle*c.track*.5f-progress;
+                healthy=isfinite(angle)&&isfinite(rate)&&fabsf(rate)<=5&&isfinite(offset);
+            }
+        }
+        float disagreement_limit=fmaxf(.005f,fminf(.020f,.03f*c.target_m));
+        bool disagreement=healthy&&fabsf(offset)>disagreement_limit;
+        t.valid=healthy&&!disagreement;
+        if(!t.valid) {
+            if(!t.stop_reason)t.stop_reason=disagreement?4:3;
+            c.distance_stop_reason=3;d2_soft_stop(c,ms);
+        } else {
+            t.sample_ms=imu->sample_ms;t.angle_rad=angle;t.yaw_rate=rate;
+            t.offset_m=offset;
+            float encoder_rate=(d2_wheel_direction(c,0)*tick_mps[0]+d2_wheel_direction(c,1)*tick_mps[1])*.5f;
+            t.rate_offset_mps=c.direction*rate*c.track*.5f-encoder_rate;
+        }
+        progress+=t.offset_m;
+    }
+
     // Disable outputs at deadline; the host checks final distance only after standstill.
 
     // Existing 30 mm overtravel and duration+1s limits remain active in STOPPING.
 
-    if(elapsed>=c.duration_s){if(c.distance_priority && c.state==D2_MOVE)c.distance_stop_reason=2;d2_soft_stop(c,ms);}
+    if(elapsed>=c.duration_s) {
+        if(c.turning&&c.time_priority&&c.turn_feedback.used_in_run&&c.turn_feedback.finish_phase&&c.state==D2_MOVE) {
+            if(c.turn_feedback.finish_phase==2)c.turn_feedback.correction_elapsed_ms=(uint16_t)fminf(1000,ms-c.turn_feedback.correction_ms);
+            c.turn_feedback.finish_phase=3;d2_turn_power_off(c);
+        } else {if(c.distance_priority&&c.state==D2_MOVE)c.distance_stop_reason=2;d2_soft_stop(c,ms);}
+    }
 
     float v=c.cruise_mps;
 
@@ -676,12 +1077,26 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
         if(elapsed>=motion && remaining>.001f)v=fmaxf(v,fminf(.035f,c.cruise_mps));
 
         bool done=true;
-
+        if(c.turn_feedback.used_in_run) {
+            // Yaw is one coupled axis: do not latch/coast one wheel while the
+            // other changes the IMU-derived progress of BOTH virtual wheels.
+            // Keep encoder centering active until the shared angular cutoff.
+            float speed=fmaxf(0,c.direction*c.turn_feedback.yaw_rate*c.track*.5f);
+            float coast=d2_clamp(speed*.15f,.0005f,.006f);
+            done=c.turn_feedback.valid&&speed<=.04f&&progress>=c.target_m-coast;
+            auto &t=c.turn_feedback;
+            if(!t.finish_phase&&done) {
+                t.finish_phase=1;t.cutoff_ms=t.last_edge_ms=ms;t.cutoff_angle_rad=t.angle_rad;
+                for(int i=0;i<2;i++)t.finish_count[i]=c.counts[i];
+            }
+            if(t.finish_phase)done=d2_turn_finish_tick(c,ms);
+            c.distance_phase=done?1:0;
+        } else {
         for(int i=0;i<2;i++) {
 
-            float speed=fmaxf(0,d2_wheel_direction(c,i)*tick_mps[i]);
+            float speed=fmaxf(0,d2_feedback_speed(c,i,tick_mps[i]));
 
-            float wheel_progress=d2_wheel_direction(c,i)*c.distance[i];
+            float wheel_progress=d2_feedback_progress(c,i);
 
             float coast=fminf(.006f,fmaxf(.002f,speed*.15f));
 
@@ -722,6 +1137,7 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
         c.distance_phase=(c.terminal_learned[0]||c.terminal_learned[1])?2:
 
                          (c.terminal_coasting[0]||c.terminal_coasting[1]||c.distance_wheel_done[0]||c.distance_wheel_done[1])?1:0;
+        }
 
         if(done){c.position_cutoff_latched=true;c.distance_stop_reason=1;d2_soft_stop(c,ms);v=0;}
 
@@ -734,58 +1150,43 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
         float remaining=fmaxf(0.0f,c.target_m-progress);
 
         float measured_mps=fmaxf(0.0f,(d2_wheel_direction(c,0)*c.rpm[0]+d2_wheel_direction(c,1)*c.rpm[1])*.5f)*D2_PI*c.diameter[0]/60;
+        if(measured_mps>c.peak_achieved_mps)c.peak_achieved_mps=measured_mps;
 
         float margin=fminf(.05f,measured_mps*.25f);
 
         c.position_ref_m=c.target_m;c.position_trim_rpm=0;
 
-        // Complete only when both wheels have reached the terminal band.
-
-        // Average distance alone can hide a wheel that remains short.
-
         bool both_reached=true;
+        for(int i=0;i<2;i++) {
+            bool arrived=d2_distance_arrived(c,i);
+            if((c.distance_wheel_done[i]&&!arrived)||(c.creep.failed[i]&&!arrived)) {
+                // Do not restart a wheel after a significant post-latch retreat.
+                // Reason4 is a bounded unsuccessful stop, never target success.
+                c.distance_stop_reason=4;d2_soft_stop(c,ms);v=0;c.common_v=0;
+                both_reached=false;break;
+            }
+            if(!arrived)both_reached=false;
+        }
 
-        for(int i=0;i<2;i++)if(d2_wheel_direction(c,i)*c.distance[i]<c.target_m-.0005f)both_reached=false;
-
-        if(both_reached) {
-
-            c.position_cutoff_latched=true;c.distance_stop_reason=1;d2_soft_stop(c,ms);v=0;
-
+        if(c.state==D2_STOPPING) {
+            v=0;c.common_v=0;
+        } else if(both_reached) {
+            c.position_cutoff_latched=true;c.distance_stop_reason=1;d2_soft_stop(c,ms);v=0;c.common_v=0;
         } else if(c.distance_phase==1) {
-
-            v=0;
-
-            // Do not restart while the robot is coasting. The same move,
-
-            // watchdog, deadline and fault guards remain in force.
-
+            v=0;c.common_v=0;
             if(fabsf(c.rpm[0])<1.5f && fabsf(c.rpm[1])<1.5f &&
-
                c.pwm[0]<1 && c.pwm[1]<1 && (uint32_t)(ms-c.quiet_ms)>=200)c.distance_phase=2;
-
         } else if(c.distance_phase==2) {
-
-            v=fminf(c.cruise_mps,.03f);
-
+            v=fminf(c.cruise_mps,.03f);c.common_v=v;
         } else if(remaining<=fmaxf(.0005f,margin)) {
-
-            c.distance_phase=1;v=0;
-
+            c.distance_phase=1;v=0;c.common_v=0;
         } else {
-
-            // Reserve a bounded distance for sensing/control lag before applying
-
-            // the deceleration envelope. 0.20 s is a conservative hypothesis,
-
-            // not a calibrated measurement or a guarantee of stopping distance.
-
             float preview_m=fminf(.05f,measured_mps*.20f);
-
             v=fminf(v,sqrtf(.30f*fmaxf(0.0f,remaining-preview_m)));
-
             float startup_s=fmaxf(c.ramp_s,c.low_startup_s);
             if(elapsed<startup_s)v*=elapsed/startup_s;
 
+            // The HIGH limiter runs after Governor and joint headroom allocation.
         }
 
     } else if(c.state==D2_MOVE) {
@@ -807,6 +1208,75 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
     float delta_s=dt*.001f;
     float previous_gain_alpha=c.gains.alpha;
     d2_gs_tick(c,delta_s);
+
+    float v_diff_raw = 0.0f;
+    c.high_ctrl.headroom_limited = false;
+    c.high_ctrl.omega_cmd=0;c.high_ctrl.accel_limited=false;
+    c.startup_accel_scale=1;c.startup_heading_guard=false;
+
+    // Feature weight filter with 150ms bounded transition
+    float target_weight = 0.0f;
+    if (c.high_ctrl.mode > 0 && c.state==D2_MOVE && c.cruise_mps > .30f && c.distance_priority && !c.time_priority && !c.turning) {
+        float remaining_w = fmaxf(0.0f, c.target_m - progress);
+        float measured_mps_w = fmaxf(0.0f, (d2_wheel_direction(c,0)*c.rpm[0] + d2_wheel_direction(c,1)*c.rpm[1])*.5f)*D2_PI*c.diameter[0]/60;
+        float margin_w = fminf(.05f, measured_mps_w * .25f);
+        if (c.distance_phase == 0 && remaining_w > margin_w) {
+            target_weight = d2_gs_weight(c.cruise_mps);
+        }
+    }
+    float weight_step = delta_s / 0.150f;
+    c.high_ctrl.high_weight += d2_clamp(target_weight - c.high_ctrl.high_weight, -weight_step, weight_step);
+    c.high_ctrl.high_weight = d2_clamp(c.high_ctrl.high_weight, 0.0f, 1.0f);
+
+    c.high_ctrl.active=c.high_ctrl.mode>0 && c.state==D2_MOVE && c.distance_priority &&
+        !c.time_priority && !c.turning && c.cruise_mps>.30f;
+    if (c.high_ctrl.mode == 2 && (c.high_ctrl.active || c.high_ctrl.high_weight>0) && c.state == D2_MOVE) {
+        // IMU Health verification
+        bool imu_fresh=d2_high_imu_ready(imu,ms) && c.high_ctrl.reference_valid &&
+            imu->calibration_id==c.high_ctrl.imu_epoch;
+
+        if (!imu_fresh) {
+            c.high_ctrl.imu_ok = false;
+            c.distance_stop_reason = 3; // IMU lost/invalid during Mode 2 run
+            d2_soft_stop(c, ms);
+            v = 0; c.common_v = 0;
+        } else {
+            c.high_ctrl.imu_ok = true;
+            c.high_ctrl.last_imu_sample_ms = imu->sample_ms;
+            c.high_ctrl.current_yaw = imu->rpy[2];
+            c.high_ctrl.gyro_z = imu->gyro[2];
+
+            // Bounded O(1) angle wrap to [-pi, pi]
+            float diff = c.high_ctrl.yaw_ref - imu->rpy[2];
+            if (!isfinite(diff)) {
+                c.high_ctrl.imu_ok = false;
+                c.distance_stop_reason = 3;
+                d2_soft_stop(c, ms);
+                v = 0; c.common_v = 0;
+            } else {
+                float e_yaw = fmodf(diff + D2_PI, 2.0f * D2_PI);
+                if (e_yaw < 0.0f) e_yaw += 2.0f * D2_PI;
+                e_yaw -= D2_PI;
+                c.high_ctrl.yaw_err = e_yaw;
+
+                // PD calculation
+                float omega_raw = c.high_ctrl.k_yaw * e_yaw - c.high_ctrl.k_rate * imu->gyro[2];
+
+                // Angular slew rate limiter
+                float max_d_omega = c.high_ctrl.slew_omega * delta_s;
+                float omega = d2_clamp(omega_raw, c.high_ctrl.omega_filtered - max_d_omega, c.high_ctrl.omega_filtered + max_d_omega);
+                omega = d2_clamp(omega, -c.high_ctrl.max_omega, c.high_ctrl.max_omega);
+                c.high_ctrl.omega_filtered = omega;
+
+                // Scale omega by smooth feature weight
+                omega *= c.high_ctrl.high_weight;
+                c.high_ctrl.omega_cmd = omega;
+
+                v_diff_raw = c.direction * (omega * c.track * 0.5f);
+
+            }
+        }
+    }
 
     // Prior-cycle outputs only: require both a real tracking deficit and sustained saturation.
 
@@ -870,6 +1340,50 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
 
     c.lead_cap_rpm=0;
 
+    // One mixer for the experimental path. LOW/mode0/other commands retain B2.
+    // Ksync is tracking feedback, never part of the integrated heading reference.
+    bool joint_path=c.high_ctrl.mode>0 && c.state==D2_MOVE && c.distance_priority &&
+        !c.time_priority && !c.turning && c.distance_phase==0 &&
+        (c.high_ctrl.active || c.high_ctrl.high_weight>0 || c.common_v>.30f);
+    float joint_target[2]={},without_heading[2]={},joint_base[2]={};
+    float heading_delta_m=0;
+    if(joint_path) {
+        float common=v*c.governor_scale*c.accuracy_scale;
+        float heading=v_diff_raw*c.governor_scale*c.accuracy_scale;
+        float budget=c.high_ctrl.max_wheel_offset,off=c.high_ctrl.wheel_offset[0];
+        heading=d2_clamp(heading,(-budget-off)/delta_s,(budget-off)/delta_s);
+        heading=d2_clamp(heading,-common,common);
+        float circumference=D2_PI*(c.diameter[0]+c.diameter[1])*.5f;
+        float sync=-c.trim*circumference/60;
+        float total=sync+heading;
+        float max_v=c.max_rpm*D2_PI*fminf(c.diameter[0],c.diameter[1])/60;
+        float headroom=fmaxf(0,max_v-fabsf(total));
+        if(common>headroom){common=headroom;c.high_ctrl.headroom_limited=true;}
+        // C2: give the existing heading controller time to recover during reverse
+        // HIGH startup. Reduce only positive common acceleration, never braking,
+        // LOW, forward motion or mode1. No extra turn, timeout extension or retry.
+        if(c.direction<0 && c.high_ctrl.mode==2 && c.high_ctrl.active &&
+           c.high_ctrl.imu_ok && elapsed<1.5f) {
+            float error=c.high_ctrl.yaw_err;
+            float outward=error*c.high_ctrl.gyro_z<0?fabsf(c.high_ctrl.gyro_z):0;
+            float predicted=fabsf(error)+.25f*outward;
+            const float soft_angle=.5f*D2_PI/180;
+            c.startup_accel_scale=d2_clamp(soft_angle/fmaxf(soft_angle,predicted),.35f,1.0f);
+            c.startup_heading_guard=c.startup_accel_scale<.999f;
+        }
+        float upper=c.common_v+c.high_ctrl.a_max*c.startup_accel_scale*delta_s;
+        if(common>upper){common=upper;c.high_ctrl.accel_limited=true;}
+        common=fmaxf(0,common);c.common_v=common;
+        total=d2_clamp(total,-common,common);
+        float baseline=d2_clamp(sync,-common,common);
+        for(int i=0;i<2;i++) {
+            float sign=i==0?1.0f:-1.0f,conv=60/(D2_PI*c.diameter[i]);
+            joint_target[i]=(common+sign*total)*conv;
+            without_heading[i]=(common+sign*baseline)*conv;
+            joint_base[i]=(common+sign*(total-baseline))*conv;
+        }
+    } else c.common_v=(c.state==D2_MOVE?v*c.governor_scale*c.accuracy_scale:0);
+
     for(int i=0;i<2;i++) {
 
         if(c.time_priority&&(c.distance_wheel_done[i]||c.terminal_coasting[i])) {
@@ -897,6 +1411,7 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
         base*=c.governor_scale*c.accuracy_scale;
 
         float target=base>0?d2_clamp(base+(i==0?-c.trim:c.trim),0,c.max_rpm):0;
+        if(joint_path){base=joint_base[i];target=joint_target[i];}
 
         if(c.time_priority&&c.state==D2_MOVE) {
 
@@ -906,7 +1421,7 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
 
             // it must not replace independent recovery of lost wheel travel.
 
-            float wheel_progress=d2_wheel_direction(c,i)*c.distance[i];
+            float wheel_progress=d2_feedback_progress(c,i);
 
             float sync_mps=(i==0?-c.trim:c.trim)*D2_PI*c.diameter[i]/60;
 
@@ -929,6 +1444,7 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
             float remaining=fmaxf(0,c.target_m-wheel_progress);
 
             float measured=fmaxf(0,d2_wheel_direction(c,i)*c.rpm[i])*D2_PI*c.diameter[i]/60;
+            if(c.turn_feedback.used_in_run)measured=fmaxf(0,d2_feedback_speed(c,i,tick_mps[i]));
 
             requested=d2_clamp(requested,0,c.cruise_mps);
 
@@ -977,6 +1493,7 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
             float cap=fmaxf(0.0f,d2_wheel_direction(c,lag)*c.rpm[lag]+1.0f);
 
             if(target>cap){target=cap;c.governor_used=true;c.governor_reason|=2;c.lead_cap_rpm=cap;}
+            if(joint_path)without_heading[i]=fminf(without_heading[i],cap);
 
         }
 
@@ -986,11 +1503,12 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
 
             // move ends so noise cannot restart it. No reversal is permitted.
 
-            if(!c.time_priority&&d2_wheel_direction(c,i)*c.distance[i]>=c.target_m-.0005f)c.distance_wheel_done[i]=true;
+            if(!c.time_priority&&d2_distance_arrived(c,i))c.distance_wheel_done[i]=true;
 
             if(c.distance_wheel_done[i]) {
 
                 c.base[i]=c.effective[i]=c.pwm[i]=0;
+                c.creep.boost[i]=0;
 
                 pi_controller_init(&c.pi[i]);
 
@@ -1014,9 +1532,16 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
 
         // not the unused legacy common-speed reference.
 
+        bool turn_finish=c.turning&&c.time_priority&&c.turn_feedback.used_in_run&&c.turn_feedback.finish_phase;
+        if(turn_finish)target=c.turn_feedback.finish_phase==2?fminf(target,.03f*60/(D2_PI*c.diameter[i])):0;
         c.base[i]=d2_wheel_direction(c,i)*(c.time_priority?target:base);
 
-        float shaped=decel_tail_shaper_step(fabsf(c.effective[i]),target,c.tune[i].ramp,c.tune[i].jerk,delta_s);
+        float previous_sp=fabsf(c.effective[i]);
+        float shaped=decel_tail_shaper_step(previous_sp,target,c.tune[i].ramp,c.tune[i].jerk,delta_s);
+        if(joint_path && c.high_ctrl.mode==2) {
+            float baseline=decel_tail_shaper_step(previous_sp,without_heading[i],c.tune[i].ramp,c.tune[i].jerk,delta_s);
+            heading_delta_m+=(i==0?1.0f:-1.0f)*.5f*(shaped-baseline)*D2_PI*c.diameter[i]/60*delta_s;
+        }
 
         c.effective[i]=d2_wheel_direction(c,i)*shaped;
 
@@ -1030,6 +1555,12 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
         cfg.mode=AW_MODE_TRACKING;cfg.ff_enabled=true;cfg.ff_slope=t.slope;cfg.ff_intercept=t.offset;
 
         cfg.max_pwm=c.max_pwm;cfg.min_pwm=0;cfg.slew_counts_per_tick=c.slew;
+        if(turn_finish&&c.turn_feedback.finish_phase==2)cfg.max_pwm=fminf(cfg.max_pwm,120);
+        float creep_boost=d2_creep_assist(c,i,shaped,dt);
+        if(c.creep.used[i]&&!c.creep.spent[i]) {
+            cfg.ff_intercept+=creep_boost;
+            cfg.max_pwm=fminf(cfg.max_pwm,120.0f);
+        }
 
         if(!pi_controller_step(&cfg,&c.pi[i],target,shaped,d2_wheel_direction(c,i)*c.rpm[i],&c.result[i])) {
 
@@ -1049,13 +1580,18 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
 
         if(stall_command && c.pwm[i]>40 && fabsf(c.rpm[i])<1) {
 
-            c.stall_ms[i]+=(uint16_t)dt;
+            if(c.creep.confirmed[i])c.stall_ms[i]=0;
+            else c.stall_ms[i]+=(uint16_t)dt;
 
             if(c.stall_ms[i]>=800){
 
                 if(c.distance_priority && c.distance_phase==2) {
 
-                    c.position_cutoff_latched=true;c.distance_stop_reason=1;d2_soft_stop(c,ms);return;
+                    // A creep stall alone is not evidence that BOTH targets
+                    // were reached. Keep the stop bounded and truthfully failed.
+                    bool arrived=c.time_priority||(d2_distance_arrived(c,0)&&d2_distance_arrived(c,1));
+                    c.position_cutoff_latched=arrived;c.distance_stop_reason=arrived?1:4;
+                    d2_soft_stop(c,ms);return;
 
                 }
 
@@ -1067,7 +1603,15 @@ static inline void d2_step(D2Core &c,int64_t raw1,int64_t raw2,uint32_t ms) {
 
     }
 
-    if(c.state==D2_STOPPING && ((c.pwm[0]<1&&c.pwm[1]<1&&fabsf(c.rpm[0])<1.5f&&fabsf(c.rpm[1])<1.5f)||ms-c.stop_ms>=500))d2_stop(c);
+    if(joint_path && c.high_ctrl.mode==2 && c.state==D2_MOVE) {
+        c.high_ctrl.wheel_offset[0]=d2_clamp(c.high_ctrl.wheel_offset[0]+heading_delta_m,
+            -c.high_ctrl.max_wheel_offset,c.high_ctrl.max_wheel_offset);
+        c.high_ctrl.wheel_offset[1]=-c.high_ctrl.wheel_offset[0];
+        c.high_ctrl.omega_cmd=c.direction*2*heading_delta_m/(delta_s*c.track);
+    }
+
+    if(c.terminal_settle.pending)d2_terminal_settle_tick(c,ms,imu);
+    else if(c.state==D2_STOPPING && ((c.pwm[0]<1&&c.pwm[1]<1&&fabsf(c.rpm[0])<1.5f&&fabsf(c.rpm[1])<1.5f)||ms-c.stop_ms>=500))d2_stop(c);
 
 }
 
