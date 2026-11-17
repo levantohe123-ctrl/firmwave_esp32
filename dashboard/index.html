@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f3f5ef">
+  <title>DUAL / Điều khiển robot</title>
+  <link rel="icon" href="/iuh-logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="IUH — Điều khiển robot"><img class="iuh-logo" src="/iuh-logo.svg" alt="IUH — Đại học Công nghiệp Thành phố Hồ Chí Minh" width="161" height="58"></a>
+    <div class="connection"><span class="status-dot" id="linkDot"></span><span id="linkText">Đang tìm robot</span><span class="wifi-symbol" aria-hidden="true">◔</span></div>
+  </header>
+  <main>
+    <section class="intro">
+      <div><p class="eyebrow">ROBOT VI SAI / ĐIỀU KHIỂN KHÔNG DÂY</p><h1>Mọi chuyển động.<br><span>Trong tầm tay.</span></h1></div>
+      <div class="connect-block"><button class="button primary" id="connect" disabled>Kết nối điều khiển <span>↗</span></button><p id="connectHint">Kết nối Wi-Fi DUAL-ROBOT để bắt đầu.</p></div>
+    </section>
+    <div id="notice" class="notice" role="status" aria-live="polite">Đang chờ dữ liệu từ ESP32…</div>
+    <section class="telemetry" aria-label="Dữ liệu trực tiếp">
+      <div class="metric speed-metric"><span class="eyebrow">VẬN TỐC THỰC</span><div><strong id="speedValue">—</strong><span class="unit">m/s</span></div><div class="speed-track"><i id="speedBar"></i></div></div>
+      <div class="metric"><span class="eyebrow">QUÃNG ĐƯỜNG LƯỢT</span><div><strong id="distanceValue">—</strong><span class="unit">m</span></div><span class="metric-note" id="targetNote">Ước lượng từ encoder</span></div>
+      <div class="metric heading-metric"><div><span class="eyebrow">HƯỚNG IMU</span><div><strong id="yawValue">—</strong><span class="unit">°</span></div><span class="metric-note" id="imuState">Chưa có dữ liệu</span></div><div class="compass" aria-hidden="true"><span>0</span><svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="31"/><path d="M40 5v7M40 68v7M5 40h7M68 40h7"/><g id="headingArrow"><path class="needle" d="M40 18l9 31-9-5-9 5z"/><circle class="hub" cx="40" cy="40" r="3"/></g></svg></div></div>
+    </section>
+    <section class="battery-strip" id="batteryStrip" aria-label="Trạng thái pin">
+      <div class="battery-gauge" aria-hidden="true"><i id="batteryFill"></i></div>
+      <div class="battery-main"><strong id="batteryPercent">—%</strong><span id="batteryVoltage">— V</span></div>
+    </section>
+    <div id="batteryAlert" class="battery-alert" role="status" aria-live="polite" hidden></div>
+    <nav class="mode-tabs" aria-label="Chế độ điều khiển"><button class="selected" data-tab="remote" aria-selected="true">01 <span>Remote</span></button><button data-tab="mission" aria-selected="false">02 <span>Đặt lệnh</span></button></nav>
+    <div class="control-grid">
+      <section class="card remote-card" id="remotePanel">
+        <div class="card-heading"><div><span class="eyebrow">01 / ĐIỀU KHIỂN THỦ CÔNG</span><h2>Nhấn giữ để di chuyển</h2></div><span class="tag">REMOTE</span></div>
+        <p class="subtle">Giữ tiến/lùi và thêm trái/phải để rẽ. Thả tay để dừng.</p>
+        <div class="layout-switch" aria-label="Bố cục remote"><button class="selected" data-layout="center" aria-pressed="true">Cụm giữa</button><button data-layout="split" aria-pressed="false">Hai bên</button></div>
+        <div class="dpad" id="directionPad" data-layout="center" role="group" aria-label="Remote nhấn giữ">
+          <div class="dpad-orbit" aria-hidden="true"></div>
+          <button class="drive up" data-dir="forward" disabled aria-label="Nhấn giữ để đi tiến"><span class="arrow">↑</span><span>Tiến</span></button>
+          <button class="drive left" data-dir="left" disabled aria-label="Nhấn giữ để xoay trái"><span class="arrow">↶</span><span>Trái</span></button>
+          <div class="pad-center" aria-hidden="true"><svg viewBox="0 0 48 48"><rect x="14" y="10" width="20" height="29" rx="7"/><path d="M24 3l-4 5h8zM10 19v12M38 19v12M20 22l4-5 4 5M24 17v12"/></svg></div>
+          <button class="drive right" data-dir="right" disabled aria-label="Nhấn giữ để xoay phải"><span class="arrow">↷</span><span>Phải</span></button>
+          <button class="drive down" data-dir="reverse" disabled aria-label="Nhấn giữ để đi lùi"><span class="arrow">↓</span><span>Lùi</span></button>
+        </div>
+        <div class="speed-setting"><div class="label-row"><label for="remoteSpeed">Tốc độ remote</label><output id="remoteSpeedValue" for="remoteSpeed">0,20 <small>m/s</small></output></div><input id="remoteSpeed" type="range" min="0.1" max="0.6" step="0.05" value="0.2"><div class="range-labels"><span>0,10 m/s</span><span>0,60 m/s</span></div></div>
+        <p class="footnote"><span class="keycap">↑ ↓ ← →</span> Có thể dùng phím mũi tên trên máy tính.</p>
+      </section>
+      <section class="card mission-card" id="missionPanel">
+        <div class="card-heading"><div><span class="eyebrow">02 / DI CHUYỂN THEO MỤC TIÊU</span><h2>Đặt một hành trình</h2></div><span class="tag">SETPOINT</span></div>
+        <div class="segmented" role="group" aria-label="Loại hành trình"><button class="selected" data-mission="move">Đi thẳng <span>↗</span></button><button data-mission="turn">Quay tại chỗ <span>↻</span></button></div>
+        <form id="moveForm">
+          <fieldset id="moveFields"><legend class="sr-only">Lệnh đi thẳng</legend>
+            <label class="field-label" for="moveDirection">Hướng di chuyển</label><select id="moveDirection"><option value="forward">↑ Đi tiến</option><option value="reverse">↓ Đi lùi</option></select>
+            <div class="field-grid"><div><label class="field-label" for="distance">Quãng đường</label><div class="input-wrap"><input id="distance" type="number" inputmode="decimal" min="0.05" max="5" step="0.05" value="1.5" required><span>m</span></div></div><div><label class="field-label" for="moveSpeed">Tốc độ đặt</label><div class="input-wrap"><input id="moveSpeed" type="number" inputmode="decimal" min="0.1" max="0.6" step="0.05" value="0.3" required><span>m/s</span></div></div></div>
+            <div class="presets" aria-label="Chọn nhanh tốc độ"><button type="button" data-speed="0.2">0,2</button><button type="button" class="selected" data-speed="0.3">0,3</button><button type="button" data-speed="0.4">0,4</button><button type="button" data-speed="0.5">0,5</button><button type="button" data-speed="0.6">0,6 <small>m/s</small></button></div>
+          </fieldset>
+          <div class="mission-note"><span class="small-icon">↗</span><p>Tự tăng tốc, giảm tốc và dừng tại đích.<br><span>Đoạn ngắn có thể chưa đạt tốc độ đặt.</span></p></div>
+          <button class="button primary launch" type="submit" disabled>Bắt đầu đi thẳng <span>→</span></button>
+        </form>
+        <form id="turnForm" hidden>
+          <fieldset id="turnFields"><legend class="sr-only">Lệnh quay tại chỗ</legend>
+            <label class="field-label" for="turnDirection">Chiều quay</label><select id="turnDirection"><option value="left">↶ Quay trái</option><option value="right">↷ Quay phải</option></select>
+            <div class="field-grid"><div><label class="field-label" for="angle">Góc quay</label><div class="input-wrap"><input id="angle" type="number" inputmode="decimal" min="5" max="360" step="1" value="180" required><span>°</span></div></div><div><label class="field-label" for="turnSeconds">Thời gian đặt</label><div class="input-wrap"><input id="turnSeconds" type="number" inputmode="decimal" min="2" max="60" step="0.5" value="6" required><span>s</span></div></div></div>
+            <div class="presets" aria-label="Chọn nhanh góc quay"><button type="button" data-angle="90">90°</button><button type="button" class="selected" data-angle="180">180°</button><button type="button" data-angle="360">360°</button></div>
+          </fieldset>
+          <div class="mission-note"><span class="small-icon">◎</span><p>IMU đo góc và bù pha cuối khi quay.<br><span>Giữ vùng quanh robot thông thoáng.</span></p></div>
+          <button class="button primary launch" type="submit" disabled>Bắt đầu quay <span>↻</span></button>
+        </form>
+      </section>
+    </div>
+    <section class="sensor-strip"><div class="sensor-icon" aria-hidden="true">◎</div><div class="sensor-description"><h3>Cảm biến hướng</h3><p id="calHint">Để xe đứng yên và hiệu chỉnh IMU trước khi chạy.</p></div><button id="calibrate" class="button secondary" disabled>Hiệu chỉnh IMU</button><button id="clearFault" class="button secondary" hidden disabled>Xóa lỗi khi đã dừng</button></section>
+    <div class="live-footer"><span><i class="mini-dot"></i> <span id="motionState">Chưa kết nối</span></span><span id="wheelReadings">M1 — &nbsp; / &nbsp; M2 — RPM</span><span>ESP32 · C8 + A1</span></div>
+  </main>
+</div>
+<footer class="stop-dock"><div><span class="dock-state" id="dockState">ĐIỀU KHIỂN ĐÃ KHÓA</span><span class="dock-hint">Mất kết nối sẽ ngắt đầu ra motor.</span></div><button id="stop" class="stop-button"><span>■</span> DỪNG NGAY <kbd>Esc</kbd></button></footer>
+<dialog id="calDialog"><div class="dialog-icon">◎</div><h2>Hiệu chỉnh hướng IMU</h2><p>Giữ robot đứng yên trên mặt sàn. Không chạm hoặc di chuyển xe trong khoảng 4 giây. Hướng hiện tại sẽ trở thành mốc yaw mới.</p><div class="dialog-actions"><button class="button secondary" id="cancelCal">Để sau</button><button class="button primary" id="confirmCal">Bắt đầu hiệu chỉnh</button></div></dialog>
+</body>
+</html>

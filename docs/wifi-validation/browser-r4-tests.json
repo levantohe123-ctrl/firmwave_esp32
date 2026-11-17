@@ -1,0 +1,57 @@
+{
+  "result": "PASS",
+  "checks": 57,
+  "errors": [],
+  "hardware": false,
+  "connections": 2,
+  "stateReads": 17,
+  "frames": 150,
+  "commands": [
+    {
+      "op": "stop",
+      "seq": "53",
+      "seen": "5500"
+    },
+    {
+      "op": "stop",
+      "seq": "56",
+      "seen": "5700"
+    },
+    {
+      "op": "calibrate",
+      "seq": "61",
+      "seen": "6000"
+    },
+    {
+      "op": "move",
+      "seq": "96",
+      "seen": "9000",
+      "dir": "reverse",
+      "distance": "1.5",
+      "speed": "0.4"
+    },
+    {
+      "op": "stop",
+      "seq": "99",
+      "seen": "9300"
+    },
+    {
+      "op": "turn",
+      "seq": "105",
+      "seen": "9600",
+      "dir": "right",
+      "angle": "360",
+      "seconds": "12"
+    },
+    {
+      "op": "stop",
+      "seq": "109",
+      "seen": "9900"
+    },
+    {
+      "op": "stop",
+      "seq": "35",
+      "seen": "13900"
+    }
+  ]
+}

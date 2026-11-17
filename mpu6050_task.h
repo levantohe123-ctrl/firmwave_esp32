@@ -126,6 +126,12 @@ static void imu_task(void*) {
 }
 static void imu_setup() {
     imu_init(imu_shared);
+#ifdef ROBOT_WIFI_DASHBOARD
+    // Keep the 100 Hz sensor task off core 0's Wi-Fi/HTTP work. This keeps
+    // the service's original 300-sample calibration and quality gates intact.
+    if(xTaskCreatePinnedToCore(imu_task,"mpu_observer",4096,nullptr,3,nullptr,1)!=pdPASS)
+#else
     if(xTaskCreatePinnedToCore(imu_task,"mpu_observer",4096,nullptr,1,nullptr,0)!=pdPASS)
+#endif
         imu_fail(imu_shared,6);
 }

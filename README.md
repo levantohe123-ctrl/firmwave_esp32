@@ -1,10 +1,18 @@
-# ESP32 dual motor firmware — C8 + A1
+# ESP32 dual motor firmware — C8 + A1 / Dashboard R4
+
+Dashboard **R4 STATUS** tự hiển thị pin và trạng thái khi mở trang trên Wi-Fi robot. Nút **Kết nối robot / Ngắt kết nối** chỉ quản lý quyền điều khiển; ngắt điều khiển vẫn xem được trạng thái. Thanh pin chỉ giữ phần trăm và điện áp.
+
+Remote đa chạm hỗ trợ vừa tiến/lùi vừa rẽ, hai bố cục cụm giữa/hai bên, WebSocket liên tục và tự kết nối lại. Phần Đặt lệnh có quãng đường, tốc độ, góc quay và hiệu chỉnh IMU 300 mẫu. Remote không yêu cầu IMU; hành trình dùng chính sách IMU của C8. Không có bảng chỉnh gain hoặc lịch sử phiên trên dashboard.
+
+Điện thoại kết nối **DUAL-ROBOT**, mở **http://192.168.4.1**. ESP32 tự phát Wi-Fi khi được cấp nguồn phù hợp; không cần host service hoặc Internet. Xem [hướng dẫn sử dụng](docs/WIFI_DASHBOARD.md), [thay đổi R4](docs/WIFI_R4_STATUS.md) và [lộ trình ROS2](docs/ROS2_ROADMAP.md).
+
+Build Wi-Fi: `DUAL-C8-A1-WIFI-20261117-R4-STATUS`. `pio run` mặc định build `esp32_wifi`; `pio run -e esp32dev` build bản USB. Gói R4 có 57 kiểm tra trình duyệt đạt; chi tiết và loại bằng chứng ở [hồ sơ R4](docs/wifi-validation/r4-status-verification.json).
 
 Firmware robot vi sai hai bánh, đóng gói trong thư mục **`esp32_dual_motor_firmware`**. Giữ thuật toán C8 và bốn bộ thông số A1 được chủ đồ án chấp nhận ngày 10/11/2026, đưa cấu hình đã chốt thành mặc định khi khởi động.
 
 **HIGH cố định chế độ 2: giới hạn gia tốc + bù hướng IMU. Quay tại chỗ dùng phản hồi IMU và pha kết thúc C8 mặc định.** LOW đi thẳng vẫn dùng PI + encoder, không thêm vòng giữ hướng IMU cho LOW.
 
-Build ID: `DUAL-C8-A1-PACKAGED-20261110`. Bản xuất đã build/kiểm thử offline, chưa nạp hoặc chạy lại trên xe trong đợt đóng gói. Xem [phạm vi kiểm chứng](docs/VALIDATION.md).
+Build ID lõi/USB: `DUAL-C8-A1-PACKAGED-20261110`. Xem [phạm vi kiểm chứng C8+A1](docs/VALIDATION.md).
 
 ## Cấu trúc
 
@@ -17,6 +25,14 @@ esp32_dual_motor_firmware/
 ├── decel_tail_shaper.h               # Tạo dạng đuôi giảm tốc
 ├── imu_observer.h                    # Bias gyro, quaternion/yaw
 ├── mpu6050_task.h                    # Đọc IMU I²C 100 Hz
+├── manual_drive.h                    # Trộn ga/rẽ và vòng tốc độ remote
+├── wifi_control.h                    # Quyền điều khiển, lệnh và watchdog
+├── wifi_dashboard.h                  # HTTP/WebSocket trên ESP32
+├── wifi_config.h                     # AP và build ID Wi-Fi
+├── battery_estimator.h               # Bảng OCV, lọc và giữ % dưới tải
+├── battery_task.h                    # Đo GPIO32 / ADC1
+├── dashboard/                        # HTML/CSS/JS, logo và font cục bộ
+├── tools/embed_dashboard.py          # Đóng gói assets vào flash khi build
 ├── platformio.ini
 ├── config/accepted_a1.json           # Snapshot cấu hình đã chấp nhận
 ├── docs/VALIDATION.md
@@ -24,7 +40,7 @@ esp32_dual_motor_firmware/
 └── HUONG_DAN_DIEU_KHIEN_VA_TINH_TOAN.md
 ```
 
-Root repository chính là nội dung thư mục trên. Không kèm service, web UI, Python, môi trường ảo hay binary build.
+Root repository chính là nội dung thư mục trên. Không kèm host service, môi trường ảo, log thiết bị hoặc binary sao lưu. Công cụ Python đóng gói assets khi build; không cần Python/máy tính khi vận hành.
 
 ## Thông số mặc định
 
@@ -57,12 +73,22 @@ Với PlatformIO Core đã cài:
 ```powershell
 git clone https://github.com/levantohe123-ctrl/firmwave_esp32.git esp32_dual_motor_firmware
 cd esp32_dual_motor_firmware
+pio run -e esp32_wifi
+# Tùy chọn: bản serial/USB
 pio run -e esp32dev
 ```
 
 Ghim `espressif32@6.12.0` (Arduino ESP32 2.0.17 / ESP-IDF 4.4.7). Build không tự upload. Arduino IDE cần mở sketch trong thư mục tên `esp32_dual_motor_firmware` với core tương thích. Arduino ESP32 3.x có API LEDC khác, chưa được kiểm chứng ở đây.
 
-## Khởi động
+## Khởi động qua Wi-Fi
+
+1. Cấp nguồn đúng cho ESP32 qua bộ hạ áp; không cấp pin 24 V trực tiếp vào chân nguồn 3,3 V/5 V.
+2. Kết nối điện thoại vào `DUAL-ROBOT`, mật khẩu mặc định `DualRobot-2026`, mở `http://192.168.4.1`. Đổi cấu hình AP trong `wifi_config.h` trước khi dùng ngoài môi trường đồ án.
+3. Trạng thái và pin tự cập nhật, không chiếm quyền điều khiển. Phần trăm xuất hiện khi đủ mẫu điện áp nghỉ.
+4. Bấm Kết nối robot để dùng remote hoặc hiệu chỉnh IMU và Đặt lệnh. Ngắt điều khiển gửi STOP nhưng vẫn theo dõi trạng thái.
+5. ESP32 tự đo pin khi dashboard đóng; điện thoại hiển thị trực tiếp khi còn kết nối Wi-Fi và trang đang hoạt động.
+
+## Giao tiếp serial của bản USB
 
 1. Sau reset: PWM=0, driver disable, IDLE. Có cấu hình sẵn không làm xe tự chạy.
 2. Host mở serial230400, đọc boot ID, STATUS và các GET để xác minh cấu hình. Chỉ một host sở hữu serial.
@@ -78,5 +104,8 @@ Lệnh chuyển động: `MOVE_DIST`, `SPEED_UPDATE`, `TURN_TIME`. `HIGH_CTRL_SE
 
 - [Đấu nối, thuật toán, đơn vị, ví dụ và serial](HUONG_DAN_DIEU_KHIEN_VA_TINH_TOAN.md).
 - [Build, test và giới hạn bằng chứng](docs/VALIDATION.md).
-- Giao thức hiện tại là serial riêng, chưa có micro-ROS, node ROS2, `cmd_vel` tổng quát hoặc Nav2 bridge.
+- [Dashboard Wi-Fi R4](docs/WIFI_DASHBOARD.md).
+- [Đo pin và tài nguyên giao diện](docs/BATTERY_AND_BRANDING.md).
+- [Các bước bổ sung khi chuyển sang ROS2](docs/ROS2_ROADMAP.md).
+- Hiện có serial riêng và dashboard HTTP/WebSocket; chưa có node ROS2, odometry liên tục `(x,y,phi)`, EKF hoặc cầu nối `cmd_vel` tổng quát. Lộ trình mô tả các phần cần bổ sung.
 - Chấp nhận giai đoạn dual motor không có nghĩa mọi lượt đạt mọi KPI RPM. Đoạn1.2 m có thể không đủ tăng/giảm tốc để đạt0.6 m/s.

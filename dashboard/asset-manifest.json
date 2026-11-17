@@ -1,0 +1,32 @@
+{
+  "index.html": {
+    "bytes": 10187,
+    "gzip_bytes": 3423,
+    "sha256": "5e5e1233eb34ef5d397ba4b5fd726ca8d5d3b3894184691203ea6a0817db2f23"
+  },
+  "app.css": {
+    "bytes": 18834,
+    "gzip_bytes": 5019,
+    "sha256": "f9709634d2abf4862bec05f35860c9efb3db67b76ab3e50ca8735bd30c0d77a7"
+  },
+  "app.js": {
+    "bytes": 18606,
+    "gzip_bytes": 5692,
+    "sha256": "d9a4d004aa873f697b7e0eb331345f78a94f777ce4225b2f98f8eebc89f0c74f"
+  },
+  "font.woff2": {
+    "bytes": 24532,
+    "gzip_bytes": 24560,
+    "sha256": "8c2def024c1bf31aacf3624ae3c4d701269b4ec3dc765c04830839f0d36b2d9e"
+  },
+  "font-vi.woff2": {
+    "bytes": 8388,
+    "gzip_bytes": 8411,
+    "sha256": "dbf64d973b3987844df30992c93f47d24ac8935ee8c9b1e320942aeb1b367703"
+  },
+  "iuh-logo.svg": {
+    "bytes": 22342,
+    "gzip_bytes": 8791,
+    "sha256": "02358223efa308fb6bc559a87c29a396a47240f0af445957d4d3841a1b0ffdb5"
+  }
+}

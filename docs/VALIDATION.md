@@ -1,4 +1,20 @@
-# Kiểm chứng C8 + A1
+# Kiểm chứng C8 + A1 và Dashboard R4
+
+## Gói Dashboard R4
+
+| Hạng mục | Kết quả |
+|---|---|
+| Build Wi-Fi `esp32_wifi` | PASS, hash image trong hồ sơ R4 |
+| Build USB `esp32dev` khi chuẩn bị cập nhật repository | PASS |
+| Trình duyệt mock HTTP/WebSocket | 57 kiểm tra PASS |
+| Core C++ độc lập | 41 cases PASS |
+| Guard pha cuối quay | 23 cases PASS |
+| Remote đa trục/quyền điều khiển | 1900 checks PASS |
+| Ước tính pin | 222 checks PASS |
+
+Trình duyệt kiểm tra trạng thái/pin trước và sau kết nối điều khiển, nhiều trang, mất dữ liệu/phục hồi/reboot, đa chạm, setpoint và hiệu chỉnh IMU. Đây là test mock, không phải log chạy xe. Bốn nhóm C++ dùng dữ liệu tổng hợp. Xem [browser R4](wifi-validation/browser-r4-tests.json), [native khi xuất bản](wifi-validation/publish-native-20261117.json) và [hash/bảo toàn nguồn](wifi-validation/r4-status-verification.json).
+
+Không đổi các nguồn C8/A1, ước tính pin hoặc backend so với snapshot R4 được đối chiếu. Phạm vi kiểm chứng C8 trước đây ở phần dưới giữ riêng với kiểm thử dashboard.
 
 ## Phạm vi
 

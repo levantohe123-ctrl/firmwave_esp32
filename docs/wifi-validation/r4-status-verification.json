@@ -1,0 +1,80 @@
+{
+  "timestamp": "2026-11-17T00:56:51.262591+07:00",
+  "status": "R4_STATUS_OFFLINE_BUILD_AND_BROWSER_PASS_NOT_FLASHED",
+  "build": "DUAL-C8-A1-WIFI-20261117-R4-STATUS",
+  "browser": {
+    "result": "PASS",
+    "checks": 57,
+    "errors": [],
+    "hardware": false,
+    "connections": 2,
+    "stateReads": 17,
+    "frames": 150,
+    "commands": [
+      {
+        "op": "stop",
+        "seq": "53",
+        "seen": "5500"
+      },
+      {
+        "op": "stop",
+        "seq": "56",
+        "seen": "5700"
+      },
+      {
+        "op": "calibrate",
+        "seq": "61",
+        "seen": "6000"
+      },
+      {
+        "op": "move",
+        "seq": "96",
+        "seen": "9000",
+        "dir": "reverse",
+        "distance": "1.5",
+        "speed": "0.4"
+      },
+      {
+        "op": "stop",
+        "seq": "99",
+        "seen": "9300"
+      },
+      {
+        "op": "turn",
+        "seq": "105",
+        "seen": "9600",
+        "dir": "right",
+        "angle": "360",
+        "seconds": "12"
+      },
+      {
+        "op": "stop",
+        "seq": "109",
+        "seen": "9900"
+      },
+      {
+        "op": "stop",
+        "seq": "35",
+        "seen": "13900"
+      }
+    ]
+  },
+  "binary_sha256": "f1822d35f6913b23bd03bc77c34b7459120e1a1dac1ca084377804b3914d7d8a",
+  "binary_bytes": 917328,
+  "protected_sources_unchanged": {
+    "dual_v2_core.h": "c38058c41352bc28c41f008570c620a7e12ea50358f6a1bc791c53492a93c6cb",
+    "pi_aw_controller.h": "41040c7059e07ce2703e342b607e5b426aa4a3985bf60ef09f1cfb6ee8a1a556",
+    "decel_tail_shaper.h": "30614c7d30de8e38661c333505b72af7648cd2d1bb9d678b485011baca05a831",
+    "imu_observer.h": "b25eae7eff7d03cc2e922157e40dc8703c3e8c1a4af1e30f6749133761f53a7a",
+    "firmware_config.h": "33c3d16610fc70c5bce6715f8b88930527056bbcfd87f73b6ae1d79e87ed4636",
+    "config/accepted_a1.json": "d1830302de76c21c00442e46e7ffd396fa00dccc9b1ab5a40fb33c2cc04a13bb",
+    "battery_estimator.h": "0be8ff2a02335530dfb6837cd8fbd07dfb978b1f266e5f305f6037d3860388d2",
+    "battery_task.h": "6df0420f1afef98af7a62755a2efbfab36989016202ee6e720e12c5eeeb4c83a",
+    "wifi_control.h": "1719ca75ef49a5041a6c4dbe7f745e2b976a2fa09f872fad0a896c02501b4c8f",
+    "wifi_dashboard.h": "48b25c1e12bb631c5f096ffea2945a8f3cb3edd43b02dd2b135fde463c55a049",
+    "manual_drive.h": "0b08c4214ab88a1e9aa8746e68b32c453395d7ba271d1c00f16d4ed9ac457536"
+  },
+  "flashed": false,
+  "hardware_tested": false,
+  "github_updated": false
+}

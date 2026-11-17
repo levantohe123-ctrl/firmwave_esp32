@@ -9,3 +9,18 @@
 *.exe
 test_control_core
 test_turn_finish
+*.pdb
+*.pyc
+__pycache__/
+*.zip
+
+# Publish selected summaries/previews; keep device journals and backups local.
+docs/wifi-validation/*
+!docs/wifi-validation/browser-r4-tests.json
+!docs/wifi-validation/r4-status-verification.json
+!docs/wifi-validation/native-r3-tests.json
+!docs/wifi-validation/publish-native-20261117.json
+!docs/wifi-validation/dashboard-desktop.png
+!docs/wifi-validation/dashboard-mobile-remote.png
+!docs/wifi-validation/dashboard-mobile-split.png
+!docs/wifi-validation/dashboard-mobile-setpoint.png

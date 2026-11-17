@@ -32,12 +32,21 @@ static void IRAM_ATTR read_encoder(unsigned i) {
 }
 void IRAM_ATTR encoder1(){read_encoder(0);}
 void IRAM_ATTR encoder2(){read_encoder(1);}
+#ifdef ROBOT_WIFI_DASHBOARD
+static bool remote_manual_active_locked();
+static int remote_manual_sign_locked(int i);
+static void remote_manual_step_locked(int64_t a,int64_t b,uint32_t ms,const ImuObserver *im);
+#endif
 static void apply_locked() {
     bool on=!disabled&&timer_healthy&&ctrl.outputs&&d2_running(ctrl);
     if(!on){digitalWrite(SD[0],LOW);digitalWrite(SD[1],LOW);}
     for(int i=0;i<2;i++) {
         uint16_t a=0,b=0;
-        if(on)d2_legs(ctrl.pwm[i],d2_wheel_direction(ctrl,i)*(i==0?-1:1),a,b);
+        int wheel_sign=d2_wheel_direction(ctrl,i);
+#ifdef ROBOT_WIFI_DASHBOARD
+        if(remote_manual_active_locked())wheel_sign=remote_manual_sign_locked(i);
+#endif
+        if(on)d2_legs(ctrl.pwm[i],wheel_sign*(i==0?-1:1),a,b);
         ledcWrite(i*2,a);ledcWrite(i*2+1,b);
         if(on)digitalWrite(SD[i],HIGH);
     }
@@ -197,8 +206,15 @@ static void configuration(uint32_t request) {
         c.tune[1].kp,c.tune[1].ki,c.tune[1].kaw,c.tune[1].slope,c.tune[1].offset,c.tune[1].ramp,c.tune[1].jerk);
     enqueue(response);
 }
+#ifdef ROBOT_WIFI_DASHBOARD
+static void remote_emergency_locked();
+#endif
 static void emergency() {
-    portENTER_CRITICAL(&output_mux);disabled=true;d2_stop(ctrl);apply_locked();portEXIT_CRITICAL(&output_mux);
+    portENTER_CRITICAL(&output_mux);
+#ifdef ROBOT_WIFI_DASHBOARD
+    remote_emergency_locked();
+#endif
+    disabled=true;d2_stop(ctrl);apply_locked();portEXIT_CRITICAL(&output_mux);
 }
 static void gain_configuration(uint32_t request) {
     D2Core c;portENTER_CRITICAL(&output_mux);c=ctrl;portEXIT_CRITICAL(&output_mux);
@@ -221,6 +237,13 @@ static void high_ctrl_configuration(uint32_t request) {
         c.high_ctrl.k_yaw,c.high_ctrl.k_rate,c.high_ctrl.max_omega,c.high_ctrl.slew_omega);
     if(n>0&&n<(int)sizeof(response))enqueue(response);
 }
+#ifdef ROBOT_WIFI_DASHBOARD
+#include "wifi_dashboard.h"
+static void remote_emergency_locked(){remote_session.stop(ctrl);}
+static bool remote_manual_active_locked(){return remote_session.drive.active;}
+static int remote_manual_sign_locked(int i){return remote_session.drive.sign[i];}
+static void remote_manual_step_locked(int64_t a,int64_t b,uint32_t ms,const ImuObserver *im){remote_session.drive.tick(ctrl,a,b,ms,im);remote_session.manual=remote_session.drive.active;}
+#endif
 static void handle(char *line) {
     char *end=nullptr;unsigned long id=strtoul(line,&end,10);if(end==line||*end!=' ')return;
     char *verb=end+1;char *args=strchr(verb,' ');if(args)*args++=0;
@@ -233,14 +256,37 @@ static void handle(char *line) {
     }
     ImuObserver im=imu_snapshot();
     bool ok=false;uint32_t ms=millis();
+#ifdef ROBOT_WIFI_DASHBOARD
+    if(!strcmp(verb,"BATTERY_STATUS")&&count==0&&numeric){
+        auto v=battery_snapshot(ms);
+        portENTER_CRITICAL(&battery_mux);int raw=battery_adc_raw;uint32_t mv=battery_adc_mv;const char *why=battery_adc_status;portEXIT_CRITICAL(&battery_mux);
+        snprintf(response,sizeof(response),"{\"type\":\"battery_status\",\"boot\":\"%s\",\"raw\":%d,\"adc_mv\":%lu,\"status\":\"%s\",\"valid\":%s,\"voltage\":%.3f}",boot,raw,(unsigned long)mv,why,v.valid?"true":"false",v.voltage);
+        enqueue(response);return;
+    }
+    if(!strcmp(verb,"WIFI_STATUS")&&count==0&&numeric){
+        snprintf(response,sizeof(response),"{\"type\":\"wifi_status\",\"build\":\"%s\",\"boot\":\"%s\",\"startup\":\"%s\",\"mode\":%u,\"ip\":\"%s\",\"ssid\":\"%s\",\"mac\":\"%s\",\"heap\":%u}",
+            ROBOT_WIFI_BUILD,boot,remote_startup,(unsigned)WiFi.getMode(),WiFi.softAPIP().toString().c_str(),
+            ROBOT_WIFI_SSID,WiFi.softAPmacAddress().c_str(),ESP.getFreeHeap());
+        enqueue(response);return;
+    }
+#endif
     if(!strcmp(verb,"STATUS")&&count==0){status(id);return;}
     if(!strcmp(verb,"CONFIG_GET")&&count==0){configuration(id);return;}
     if(!strcmp(verb,"GS_GET")&&count==0&&numeric){gain_configuration(id);return;}
     if(!strcmp(verb,"HIGH_CTRL_GET")&&count==0&&numeric){high_ctrl_configuration(id);return;}
     if(!strcmp(verb,"TURN_CTRL_GET")&&count==0&&numeric){turn_configuration(id);return;}
+#ifdef ROBOT_WIFI_DASHBOARD
+    // The Wi-Fi build has one motion authority. USB remains read-only + STOP.
+    if(strcmp(verb,"STOP"))return;
+#endif
     portENTER_CRITICAL(&output_mux);
     if(numeric) {
-        if(!strcmp(verb,"STOP")&&count==0){disabled=true;d2_stop(ctrl);ok=true;}
+        if(!strcmp(verb,"STOP")&&count==0){
+#ifdef ROBOT_WIFI_DASHBOARD
+            remote_session.stop(ctrl);
+#endif
+            disabled=true;d2_stop(ctrl);ok=true;
+        }
         else if(!strcmp(verb,"HEARTBEAT")&&count==0){ctrl.heartbeat_ms=ms;ok=true;}
         else if(!strcmp(verb,"CLEAR")&&count==0){ok=d2_clear(ctrl,ms,timer_healthy);}
         else if(!strcmp(verb,"IMU_CALIBRATE")&&count==0&&!d2_running(ctrl)&&ctrl.state==D2_IDLE&&d2_stationary(ctrl,ms)){ok=imu_request_calibration();}
@@ -303,6 +349,9 @@ void setup() {
     portENTER_CRITICAL(&output_mux);timer_healthy=healthy;
     if(!healthy)d2_fault(ctrl,D2_TIMER);apply_locked();portEXIT_CRITICAL(&output_mux);
     imu_setup();
+#ifdef ROBOT_WIFI_DASHBOARD
+    remote_setup();
+#endif
 }
 void loop() {
     ImuObserver im=imu_snapshot();
@@ -310,13 +359,23 @@ void loop() {
     portENTER_CRITICAL(&encoder_mux);a=enc[0];b=enc[1];portEXIT_CRITICAL(&encoder_mux);
     portENTER_CRITICAL(&output_mux);
     if((uint32_t)(ms-ctrl.last_step_ms)>=20) {
-        d2_step(ctrl,a,b,ms,&im);if(ctrl.state==D2_FAULT)disabled=true;apply_locked();
+#ifdef ROBOT_WIFI_DASHBOARD
+        if(remote_manual_active_locked())remote_manual_step_locked(a,b,ms,&im);
+        else
+#endif
+        d2_step(ctrl,a,b,ms,&im);
+        if(ctrl.state==D2_FAULT)disabled=true;apply_locked();
     }
     portEXIT_CRITICAL(&output_mux);
+#ifdef ROBOT_WIFI_DASHBOARD
+    remote_tick(im,ms);
+#endif
     // Immediate ! stop, bounded RX; overflow discards the complete line.
     for(int i=0;i<32&&Serial.available();i++) {
         char ch=Serial.read();
-        if(ch=='!'){emergency();rx_len=0;rx_discard=false;continue;}
+        if(ch=='!'){
+            emergency();rx_len=0;rx_discard=false;continue;
+        }
         if(ch=='\n') {
             if(!rx_discard&&rx_len){rx[rx_len]=0;handle(rx);}
             rx_len=0;rx_discard=false;

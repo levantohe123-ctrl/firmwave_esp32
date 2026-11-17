@@ -1,0 +1,6 @@
+{
+  "test_wifi_control": "FLEX_REMOTE_PASS checks=1900",
+  "test_control_core": "CONTROL_CORE_PASS cases=41 paired_ticks=0",
+  "test_turn_finish": "C8_TURN_GUARDS_PASS cases=23",
+  "test_battery_estimator": "BATTERY_ESTIMATOR_PASS checks=222"
+}
